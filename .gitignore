@@ -55,3 +55,4 @@ modules/jdbc-pool/includes
 webapps/docs/jdbc-pool.xml
 /test/org/apache/tomcat/util/net/ocsp/ocsp-work/
 GadgetPOC.class
+ExploitPayloadGenerator.class
