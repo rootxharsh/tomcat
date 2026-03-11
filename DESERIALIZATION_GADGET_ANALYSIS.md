@@ -286,9 +286,57 @@ The classic `BeanFactory` + `ResourceRef` JNDI gadget relied on `forceString` to
 ### Root Cause
 `ReplicationStream` extends `ObjectInputStream` with **no `ObjectInputFilter`**. Adding a filter that restricts deserialization to known-safe session types would eliminate the entire attack surface.
 
+### Root Cause
+`ReplicationStream` extends `ObjectInputStream` with **no `ObjectInputFilter`**. Adding a filter that restricts deserialization to known-safe session types would eliminate the entire attack surface.
+
 ### Risk Rating: CRITICAL
 Despite the auto-trigger gap with modern JDK, this is critical because:
 - Real-world deployments almost always have gadget libraries
 - New JDK gadget chains are discovered periodically
 - The fundamental design (no filter) is a time bomb
 - URLDNS proves the vulnerability is reachable from the cluster network
+
+---
+
+## 9. Existing PoC Files (Prior Work in Repository)
+
+The repository already contains proof-of-concept files that demonstrate the FunctionMapperImpl RCE primitive:
+
+- **`GadgetPOC.java`** — Demonstrates crafting a FunctionMapperImpl with `Function(owner=Runtime, name=exec)`, serializing it, deserializing it, then manually calling `resolveFunction()` to obtain a live `Method` handle to `Runtime.exec(String)`. Proves the method resolution works with zero validation.
+
+- **`PayloadGenerator.java`** / **`ExploitPayloadGenerator.java`** — Generate serialized payload files containing the malicious FunctionMapperImpl.
+
+- **`ExploitClient.java`** — End-to-end client that sends the payload to a vulnerable endpoint. Lines 133-136 claim that `sessionDidActivate()` triggers EL evaluation — this is aspirational, not factual. `DeltaManager` does NOT call `activate()`, and no existing class bridges from `sessionDidActivate()` to EL `getValue()`.
+
+- **`exploit-app/`** — Contains a `DeserializeServlet` that accepts POST requests with serialized objects and calls `readObject()` with no filtering.
+
+**Key observation:** All existing PoCs require **manual invocation** of `resolveFunction()` after deserialization (step 4 in GadgetPOC.java). None demonstrate an auto-triggering chain from `readObject()` to code execution. This confirms the bridge gap identified in Section 4.
+
+---
+
+## 10. Additional Attack Vectors Investigated
+
+### 10.1 DeltaRequest SessionListener Injection
+
+`DeltaRequest.execute()` handles `TYPE_LISTENER` with `ACTION_SET`:
+```java
+session.addSessionListener(listener, false);
+```
+
+`SingleSignOnListener` implements `SessionListener, Serializable` and could be injected via a crafted delta. However, its `sessionEvent()` method only performs SSO management operations (session destroy/ID change) — no EL evaluation or reflection.
+
+### 10.2 ValueExpressionLiteral Class Loading
+
+`ValueExpressionLiteral.readExternal()` calls `ReflectionUtil.forName(type)` during deserialization, which triggers `Class.forName()` and runs the target class's static initializer. However, no JDK/Tomcat class has a dangerous static initializer that would achieve code execution.
+
+### 10.3 DBCP InstanceKeyDataSource Deserialization
+
+`SharedPoolDataSource.readObject()` calls `readObjectImpl()` which goes through the factory pattern, but `getReference()` only includes `instanceKey` — not `dataSourceName` or `jndiEnvironment`. The factory creates a clean, unconfigured instance. No JNDI lookup is triggered from `readObject()`.
+
+### 10.4 Proxy-based Approaches
+
+A `java.lang.reflect.Proxy` implementing `HttpSessionActivationListener` or `HttpSessionBindingListener` would need a Serializable `InvocationHandler`. The only JDK-provided one is `sun.reflect.annotation.AnnotationInvocationHandler`, which in JDK 17+ validates the annotation type during `readObject()` and rejects non-annotation interfaces.
+
+### 10.5 Serializable Comparator Search
+
+Only one Serializable Comparator exists on the Tomcat classpath: `AbsoluteOrder.AbsoluteComparator` (compares cluster Member hosts/ports). It does not call getters, evaluate EL, or perform reflection — dead end for PriorityQueue-based chains.
