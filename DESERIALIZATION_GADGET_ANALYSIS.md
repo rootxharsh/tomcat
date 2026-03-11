@@ -130,8 +130,10 @@ When `getOutputProperties()` or `newTransformer()` is called:
 ### 3.4 Session Replication Callbacks (Tomcat) → valueBound() / sessionDidActivate()
 
 Post-deserialization, Tomcat fires:
-- `HttpSessionBindingListener.valueBound()` via `DeltaRequest.execute()` → `session.setAttribute()`
-- `HttpSessionActivationListener.sessionDidActivate()` via `StandardManager.load()` → `session.activate()`
+- `HttpSessionBindingListener.valueBound()` via `DeltaRequest.execute()` → `session.setAttribute()` (when `notifyListenersOnReplication=true`, which is the **default**)
+- **`HttpSessionActivationListener.sessionDidActivate()`** via `DeltaSession.doReadObject()` → `activate()` (**CORRECTED**: this IS called during cluster replication, not just file-based persistence)
+
+**Critical correction**: `DeltaSession.doReadObject()` at line 767 calls `activate()` DIRECTLY after deserializing all session attributes and listeners. This means `sessionDidActivate()` fires on every deserialized session attribute that implements `HttpSessionActivationListener` during cluster session state transfer via `DeltaManager.deserializeSessions()` → `session.readObjectData(ois)` → `doReadObject()` → `activate()`.
 
 ---
 
@@ -145,8 +147,8 @@ The **fundamental gap** is bridging from a trigger method (`hashCode`, `toString
 | HashMap → hashCode() | TemplatesImpl.hashCode() | Returns a simple hash, does NOT trigger bytecode loading |
 | BadAttributeValueExpException → toString() | ValueExpressionImpl.toString() | Returns `"ValueExpression[expr]"` literal — no evaluation |
 | PriorityQueue → compareTo() | — | No Serializable Comparator on Tomcat classpath that calls getters/evaluates EL |
-| valueBound() | — | No HttpSessionBindingListener on Tomcat classpath that triggers EL/JNDI/reflection |
-| sessionDidActivate() | — | Not called by DeltaManager (only by StandardManager/PersistentManagerBase for file-based persistence) |
+| valueBound() | — | No HttpSessionBindingListener on Tomcat classpath that triggers EL/JNDI/reflection (but callback IS fired via DeltaRequest with default settings) |
+| sessionDidActivate() | — | **CORRECTED**: IS called by DeltaSession.doReadObject() line 767 during cluster replication. No HttpSessionActivationListener on Tomcat classpath bridges to EL/RCE |
 
 **The EL infrastructure deliberately separates parsing from evaluation.** Parsing (triggered by `hashCode()`) produces an AST. Evaluation (triggered by `getValue(ELContext)`) requires an `ELContext`. No `readObject()` path on the Tomcat classpath provides an `ELContext`.
 
@@ -249,7 +251,14 @@ session.setAttribute(info.getName(), info.getValue(), notifyListeners, false);
 
 If `notifyListeners` is true and the value implements `HttpSessionBindingListener`, `valueBound()` fires on the deserialized object. No existing Tomcat class exploits this, but future classes or custom application code could.
 
-### 6.2 StandardSession.activate() → sessionDidActivate()
+### 6.2 DeltaSession.doReadObject() → activate() → sessionDidActivate() (CORRECTED)
+
+**File:** `java/org/apache/catalina/ha/session/DeltaSession.java:767`
+
+```java
+// At the end of doReadObject():
+activate();  // line 767
+```
 
 **File:** `java/org/apache/catalina/session/StandardSession.java:728-735`
 
@@ -259,7 +268,11 @@ if (attribute instanceof HttpSessionActivationListener) {
 }
 ```
 
-Called by `StandardManager.load()` and `PersistentManagerBase`, but **NOT** by `DeltaManager`. Only relevant for file-based session persistence, not cluster replication.
+**CORRECTED**: `DeltaSession.doReadObject()` calls `activate()` DIRECTLY at line 767 after deserializing all session attributes. This is called during cluster replication via:
+- `DeltaManager.deserializeSessions()` → `session.readObjectData(ois)` → `doReadObject()` → `activate()`
+- `DeltaSession.readExternal()` → `doReadObject()` → `activate()`
+
+This means **any deserialized session attribute implementing `HttpSessionActivationListener` gets its `sessionDidActivate()` callback fired during cluster session state transfer**. The prior analysis incorrectly stated this was only called by `StandardManager.load()` for file-based persistence.
 
 ---
 
@@ -286,9 +299,6 @@ The classic `BeanFactory` + `ResourceRef` JNDI gadget relied on `forceString` to
 ### Root Cause
 `ReplicationStream` extends `ObjectInputStream` with **no `ObjectInputFilter`**. Adding a filter that restricts deserialization to known-safe session types would eliminate the entire attack surface.
 
-### Root Cause
-`ReplicationStream` extends `ObjectInputStream` with **no `ObjectInputFilter`**. Adding a filter that restricts deserialization to known-safe session types would eliminate the entire attack surface.
-
 ### Risk Rating: CRITICAL
 Despite the auto-trigger gap with modern JDK, this is critical because:
 - Real-world deployments almost always have gadget libraries
@@ -306,7 +316,9 @@ The repository already contains proof-of-concept files that demonstrate the Func
 
 - **`PayloadGenerator.java`** / **`ExploitPayloadGenerator.java`** — Generate serialized payload files containing the malicious FunctionMapperImpl.
 
-- **`ExploitClient.java`** — End-to-end client that sends the payload to a vulnerable endpoint. Lines 133-136 claim that `sessionDidActivate()` triggers EL evaluation — this is aspirational, not factual. `DeltaManager` does NOT call `activate()`, and no existing class bridges from `sessionDidActivate()` to EL `getValue()`.
+- **`ExploitClient.java`** — End-to-end client that sends the payload to a vulnerable endpoint. Lines 133-136 claim that `sessionDidActivate()` triggers EL evaluation — this is partially correct: `DeltaSession.doReadObject()` DOES call `activate()` (see corrected Section 6.2), but no existing class bridges from `sessionDidActivate()` to EL `getValue()`.
+
+- **`DeltaSessionActivateChainPOC.java`** — Demonstrates the corrected finding that `DeltaSession.readExternal()` → `activate()` → `sessionDidActivate()` IS called during cluster replication. Documents both callback paths (sessionDidActivate via activate(), valueBound via DeltaRequest.execute()) and the FunctionMapperImpl RCE primitive.
 
 - **`exploit-app/`** — Contains a `DeserializeServlet` that accepts POST requests with serialized objects and calls `readObject()` with no filtering.
 
@@ -335,8 +347,51 @@ session.addSessionListener(listener, false);
 
 ### 10.4 Proxy-based Approaches
 
-A `java.lang.reflect.Proxy` implementing `HttpSessionActivationListener` or `HttpSessionBindingListener` would need a Serializable `InvocationHandler`. The only JDK-provided one is `sun.reflect.annotation.AnnotationInvocationHandler`, which in JDK 17+ validates the annotation type during `readObject()` and rejects non-annotation interfaces.
+A `java.lang.reflect.Proxy` implementing `HttpSessionActivationListener` or `HttpSessionBindingListener` would need a Serializable `InvocationHandler`. Two JDK-provided options exist:
+
+1. **`sun.reflect.annotation.AnnotationInvocationHandler`** — In JDK 17+ validates the annotation type during `readObject()` and rejects non-annotation interfaces. Dead end.
+
+2. **`java.rmi.server.RemoteObjectInvocationHandler`** — Extends `RemoteObject` (Serializable). Could potentially bridge `sessionDidActivate()` to a JRMP network call to an attacker-controlled server. However, `invokeRemoteMethod()` has TWO checks:
+   - `proxy instanceof Remote` — would pass if Proxy also implements `Remote`
+   - `Remote.isAssignableFrom(method.getDeclaringClass())` — FAILS because `sessionDidActivate()` is declared in `HttpSessionActivationListener`, not a `Remote` subinterface
+
+   This second check kills the JRMP bridge approach. The method's declaring class must extend `java.rmi.Remote`, which `HttpSessionActivationListener` does not.
 
 ### 10.5 Serializable Comparator Search
 
 Only one Serializable Comparator exists on the Tomcat classpath: `AbsoluteOrder.AbsoluteComparator` (compares cluster Member hosts/ports). It does not call getters, evaluate EL, or perform reflection — dead end for PriorityQueue-based chains.
+
+### 10.6 CrawlerHttpSessionBindingListener
+
+`CrawlerSessionManagerValve.CrawlerHttpSessionBindingListener` implements both `HttpSessionBindingListener` and `Serializable`. However, its `valueUnbound()` only calls `clientIdSessionId.remove()` — no dangerous operations. No `valueBound()` override.
+
+### 10.7 MapMessage.toString() Investigation
+
+`AbstractReplicatedMap.MapMessage.toString()` was investigated as a potential bridge via `BadAttributeValueExpException.readObject()` → `toString()`. However, `toString()` accesses the `key` and `value` FIELDS directly (`"key=" + key`), NOT the `getKey()`/`getValue()` methods that would trigger `XByteBuffer.deserialize()`. Dead end.
+
+### 10.8 MethodExpressionImpl / ValueExpressionLiteral Class Loading
+
+`MethodExpressionImpl.readExternal()` calls `ReflectionUtil.forName(type)` for the `expectedType` field, and `ReflectionUtil.toTypeArray()` for parameter types. Both trigger `Class.forName()` which runs static initializers. However, no JDK/Tomcat class has a static initializer that achieves code execution.
+
+### 10.9 BCEL Classes
+
+Tomcat's stripped BCEL at `org.apache.tomcat.util.bcel` contains NO Serializable classes — only classfile parsing utilities. Not usable in deserialization chains.
+
+---
+
+## 11. Corrected Callback Path Summary
+
+### Two Confirmed Post-Deserialization Callback Paths in Cluster Replication
+
+| Path | Entry Point | Callback | Default Active? |
+|------|-------------|----------|-----------------|
+| Full session state transfer | `DeltaManager.deserializeSessions()` → `session.readObjectData()` → `doReadObject()` → `activate()` | `sessionDidActivate()` on `HttpSessionActivationListener` attributes | **YES** (always) |
+| Delta attribute updates | `DeltaSession.deserializeAndExecuteDeltaRequest()` → `DeltaRequest.execute()` → `session.setAttribute()` | `valueBound()` on `HttpSessionBindingListener` attributes | **YES** (`notifyListenersOnReplication` defaults to `true`) |
+
+Both callbacks fire on attacker-controlled deserialized objects during cluster replication. The bridge gap remains: no Serializable class on the Tomcat+JDK 21 classpath implements these listener interfaces with behavior that chains to EL evaluation or arbitrary method invocation.
+
+### What This Means for Exploitability
+
+1. **Future classes**: Any Serializable `HttpSessionActivationListener` or `HttpSessionBindingListener` added to the Tomcat classpath could complete the chain
+2. **Webapp classes**: Application-specific implementations of these interfaces could be exploited if they perform dangerous operations in their callback methods
+3. **The callback IS reachable**: Prior analysis incorrectly excluded this path — it is active during standard cluster session replication
